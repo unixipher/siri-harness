@@ -48,17 +48,60 @@ public final class SiriModelService: Sendable {
                     let reasoning = String(text[openRange.upperBound..<closeRange.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
                     var content = (String(text[..<openRange.lowerBound]) + String(text[closeRange.upperBound...])).trimmingCharacters(in: .whitespacesAndNewlines)
                     content = sanitizeMessageText(content)
+                    content = normalizeContentFormat(content)
                     return (reasoning.isEmpty ? nil : reasoning, content)
                 } else {
                     // Tag opened but not closed
                     let reasoning = String(text[openRange.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
-                    let content = String(text[..<openRange.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
-                    return (reasoning.isEmpty ? nil : reasoning, sanitizeMessageText(content))
+                    var content = String(text[..<openRange.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+                    content = sanitizeMessageText(content)
+                    content = normalizeContentFormat(content)
+                    return (reasoning.isEmpty ? nil : reasoning, content)
                 }
             }
         }
 
-        return (nil, text)
+        let normalized = normalizeContentFormat(text)
+        return (nil, normalized)
+    }
+
+    /// Unwraps simulated tool call or mock search JSON payloads into natural human-readable text.
+    public static func normalizeContentFormat(_ text: String) -> String {
+        var clean = text.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if clean.hasPrefix("```") {
+            let lines = clean.components(separatedBy: .newlines)
+            if lines.count >= 3 && lines.last?.trimmingCharacters(in: .whitespaces).hasPrefix("```") == true {
+                let inner = lines.dropFirst().dropLast().joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+                if inner.hasPrefix("{") && inner.hasSuffix("}") {
+                    clean = inner
+                }
+            }
+        }
+
+        guard clean.hasPrefix("{") && clean.hasSuffix("}") else {
+            return text
+        }
+
+        guard let data = clean.data(using: .utf8),
+              let dict = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+            return text
+        }
+
+        if let result = dict["web_search_result"] as? String, !result.isEmpty {
+            return result
+        }
+        if let answer = dict["answer"] as? String, !answer.isEmpty {
+            return answer
+        }
+        if let response = dict["response"] as? String, !response.isEmpty {
+            return response
+        }
+        if let message = dict["message"] as? String, !message.isEmpty, !message.contains("Searching for") {
+            return message
+        }
+
+        return text
     }
 
     /// Configures generation parameters mapped to FoundationModels GenerationOptions.
@@ -95,7 +138,12 @@ public final class SiriModelService: Sendable {
             .joined(separator: "\n\n")
 
         if enableThinking {
-            let thinkingDirective = "Before answering, provide your step-by-step reasoning inside <think>...</think> tags. After </think>, provide your direct answer. Do not repeat instructions or out-of-band headers."
+            let thinkingDirective = """
+            Before answering, provide your step-by-step reasoning inside <think>...</think> tags.
+            After </think>, provide your final answer in normal, natural conversational prose (plain text or markdown).
+            Never format your answer as simulated tool execution JSON, pseudo-code payloads, or raw JSON dictionaries unless the user explicitly requested JSON.
+            Do not repeat instructions or out-of-band headers.
+            """
             if systemInstructions.isEmpty {
                 systemInstructions = thinkingDirective
             } else {
