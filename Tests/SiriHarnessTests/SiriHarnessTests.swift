@@ -155,17 +155,13 @@ struct SiriHarnessTests {
         #expect(str.contains("\"content\":\"Hello\""))
     }
 
-    @Test("ModelListResponse lists supported models including flash and pro")
+    @Test("ModelListResponse lists exactly the 2 supported models: flash and pro")
     func testModelListResponse() throws {
         let models = SiriModelService.supportedModels.map { ModelObject(id: $0) }
         let response = ModelListResponse(data: models)
         let ids = response.data.map(\.id)
 
-        #expect(ids.contains("siri-flash"))
-        #expect(ids.contains("siri-pro"))
-        #expect(ids.contains("siri"))
-        #expect(ids.contains("siri-reasoner"))
-        #expect(ids.contains("apple-intelligence"))
+        #expect(ids == ["siri-flash", "siri-pro"])
     }
 
     @Test("Verify isReasoningEnabled profile routing")

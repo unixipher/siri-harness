@@ -5,19 +5,10 @@ import FoundationModels
 public final class SiriModelService: Sendable {
     public static let shared = SiriModelService()
 
-    /// Standard supported model identifier aliases.
+    /// Exactly two supported models: siri-flash and siri-pro.
     public static let supportedModels = [
         "siri-flash",
-        "siri-pro",
-        "siri",
-        "siri-reasoner",
-        "siri-thinking",
-        "apple-intelligence-flash",
-        "apple-intelligence-pro",
-        "apple-intelligence",
-        "apple-intelligence-reasoner",
-        "apple/system-language-model",
-        "default"
+        "siri-pro"
     ]
 
     public init() {}
