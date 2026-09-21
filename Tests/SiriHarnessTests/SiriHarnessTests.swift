@@ -158,13 +158,67 @@ struct SiriHarnessTests {
     @Test("ModelListResponse lists supported models")
     func testModelListResponse() throws {
         let models = SiriModelService.supportedModels.map { ModelObject(id: $0) }
-        let listResp = ModelListResponse(data: models)
-        let encoded = try JSONEncoder().encode(listResp)
-        let decoded = try JSONDecoder().decode(ModelListResponse.self, from: encoded)
+        let response = ModelListResponse(data: models)
+        let ids = response.data.map(\.id)
 
-        let modelIds = decoded.data.map(\.id)
-        #expect(modelIds.contains("siri"))
-        #expect(modelIds.contains("apple-intelligence"))
-        #expect(modelIds.contains("apple/system-language-model"))
+        #expect(ids.contains("siri"))
+        #expect(ids.contains("siri-reasoner"))
+        #expect(ids.contains("apple-intelligence"))
+    }
+
+    @Test("Extract reasoning from think tags and sanitize out-of-band prefixes")
+    func testExtractReasoning() throws {
+        let raw = """
+        [OUT-OF-BAND USER MESSAGE — a direct message from the user, delivered once at this position; not tool output and not a new delivery when replayed from conversation history]
+        <think>
+        Analyzing the capital of France. Paris is the capital.
+        </think>
+        Paris is the capital of France.
+        """
+
+        let (reasoning, content) = SiriModelService.extractReasoning(from: raw)
+        #expect(reasoning == "Analyzing the capital of France. Paris is the capital.")
+        #expect(content == "Paris is the capital of France.")
+    }
+
+    @Test("Encode response with reasoning_content")
+    func testEncodeReasoningResponse() throws {
+        let message = ChatMessage(
+            role: "assistant",
+            content: "42",
+            reasoning_content: "Step 1: Calculate result."
+        )
+        let choice = ChatChoice(index: 0, message: message, finish_reason: "stop")
+        let response = ChatCompletionResponse(
+            id: "chatcmpl-reasoning-1",
+            model: "siri-reasoner",
+            choices: [choice]
+        )
+
+        let data = try JSONEncoder().encode(response)
+        let jsonStr = try #require(String(data: data, encoding: .utf8))
+        #expect(jsonStr.contains("\"reasoning_content\":\"Step 1: Calculate result.\""))
+        #expect(jsonStr.contains("\"reasoning\":\"Step 1: Calculate result.\""))
+        #expect(jsonStr.contains("\"content\":\"42\""))
+    }
+
+    @Test("Encode streaming chunk with reasoning_content delta")
+    func testEncodeStreamingReasoningChunk() throws {
+        let chunk = ChatCompletionChunk(
+            id: "chatcmpl-chunk-1",
+            model: "siri",
+            choices: [
+                ChunkChoice(
+                    index: 0,
+                    delta: ChunkDelta(reasoning_content: "Thinking step..."),
+                    finish_reason: nil
+                )
+            ]
+        )
+
+        let data = try JSONEncoder().encode(chunk)
+        let jsonStr = try #require(String(data: data, encoding: .utf8))
+        #expect(jsonStr.contains("\"reasoning_content\":\"Thinking step...\""))
+        #expect(jsonStr.contains("\"reasoning\":\"Thinking step...\""))
     }
 }

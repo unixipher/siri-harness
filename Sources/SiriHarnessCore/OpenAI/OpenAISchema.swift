@@ -5,11 +5,21 @@ public struct ChatMessage: Codable, Sendable, Equatable {
     public var role: String
     public var content: String
     public var name: String?
+    public var reasoning_content: String?
+    public var reasoning: String?
 
-    public init(role: String, content: String, name: String? = nil) {
+    public init(
+        role: String,
+        content: String,
+        name: String? = nil,
+        reasoning_content: String? = nil,
+        reasoning: String? = nil
+    ) {
         self.role = role
         self.content = content
         self.name = name
+        self.reasoning_content = reasoning_content
+        self.reasoning = reasoning ?? reasoning_content
     }
 }
 
@@ -22,6 +32,7 @@ public struct ChatCompletionRequest: Codable, Sendable {
     public var max_completion_tokens: Int?
     public var stream: Bool?
     public var top_p: Double?
+    public var reasoning_effort: String?
 
     public init(
         model: String? = nil,
@@ -30,7 +41,8 @@ public struct ChatCompletionRequest: Codable, Sendable {
         max_tokens: Int? = nil,
         max_completion_tokens: Int? = nil,
         stream: Bool? = nil,
-        top_p: Double? = nil
+        top_p: Double? = nil,
+        reasoning_effort: String? = nil
     ) {
         self.model = model
         self.messages = messages
@@ -39,6 +51,7 @@ public struct ChatCompletionRequest: Codable, Sendable {
         self.max_completion_tokens = max_completion_tokens
         self.stream = stream
         self.top_p = top_p
+        self.reasoning_effort = reasoning_effort
     }
 
     public var effectiveMaxTokens: Int? {
@@ -106,10 +119,19 @@ public struct ChatCompletionResponse: Codable, Sendable {
 public struct ChunkDelta: Codable, Sendable, Equatable {
     public var role: String?
     public var content: String?
+    public var reasoning_content: String?
+    public var reasoning: String?
 
-    public init(role: String? = nil, content: String? = nil) {
+    public init(
+        role: String? = nil,
+        content: String? = nil,
+        reasoning_content: String? = nil,
+        reasoning: String? = nil
+    ) {
         self.role = role
         self.content = content
+        self.reasoning_content = reasoning_content
+        self.reasoning = reasoning ?? reasoning_content
     }
 }
 

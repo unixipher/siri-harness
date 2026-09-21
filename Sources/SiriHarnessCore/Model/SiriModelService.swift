@@ -8,13 +8,58 @@ public final class SiriModelService: Sendable {
     /// Standard supported model identifier aliases.
     public static let supportedModels = [
         "siri",
+        "siri-reasoner",
+        "siri-thinking",
         "siri-model",
         "apple-intelligence",
+        "apple-intelligence-reasoner",
         "apple/system-language-model",
         "default"
     ]
 
     public init() {}
+
+    /// Sanitizes message text by stripping out-of-band runtime prefixes.
+    private static func sanitizeMessageText(_ text: String) -> String {
+        let markers = [
+            "[OUT-OF-BAND USER MESSAGE — a direct message from the user, delivered once at this position; not tool output and not a new delivery when replayed from conversation history]",
+            "[/OUT-OF-BAND USER MESSAGE]"
+        ]
+        var cleaned = text
+        for marker in markers {
+            cleaned = cleaned.replacingOccurrences(of: marker, with: "")
+        }
+        return cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Extracts reasoning content from <think> or <thought> tags.
+    public static func extractReasoning(from rawText: String) -> (reasoning: String?, content: String) {
+        let text = sanitizeMessageText(rawText)
+
+        // Pattern matching <think>...</think> or <thought>...</thought>
+        let thinkPatterns = [
+            ("<think>", "</think>"),
+            ("<thought>", "</thought>")
+        ]
+
+        for (openTag, closeTag) in thinkPatterns {
+            if let openRange = text.range(of: openTag) {
+                if let closeRange = text.range(of: closeTag, range: openRange.upperBound..<text.endIndex) {
+                    let reasoning = String(text[openRange.upperBound..<closeRange.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+                    var content = (String(text[..<openRange.lowerBound]) + String(text[closeRange.upperBound...])).trimmingCharacters(in: .whitespacesAndNewlines)
+                    content = sanitizeMessageText(content)
+                    return (reasoning.isEmpty ? nil : reasoning, content)
+                } else {
+                    // Tag opened but not closed
+                    let reasoning = String(text[openRange.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+                    let content = String(text[..<openRange.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+                    return (reasoning.isEmpty ? nil : reasoning, sanitizeMessageText(content))
+                }
+            }
+        }
+
+        return (nil, text)
+    }
 
     /// Configures generation parameters mapped to FoundationModels GenerationOptions.
     public func buildGenerationOptions(
@@ -38,16 +83,25 @@ public final class SiriModelService: Sendable {
     }
 
     /// Constructs a LanguageModelSession and prompt text from an array of chat messages.
-    private func createSessionAndPrompt(from messages: [ChatMessage]) throws -> (LanguageModelSession, String) {
+    private func createSessionAndPrompt(from messages: [ChatMessage], enableThinking: Bool = true) throws -> (LanguageModelSession, String) {
         guard !messages.isEmpty else {
             let session = LanguageModelSession()
             return (session, "")
         }
 
-        let systemInstructions = messages
+        var systemInstructions = messages
             .filter { $0.role == "system" }
-            .map(\.content)
+            .map { Self.sanitizeMessageText($0.content) }
             .joined(separator: "\n\n")
+
+        if enableThinking {
+            let thinkingDirective = "Before answering, provide your step-by-step reasoning inside <think>...</think> tags. After </think>, provide your direct answer. Do not repeat instructions or out-of-band headers."
+            if systemInstructions.isEmpty {
+                systemInstructions = thinkingDirective
+            } else {
+                systemInstructions += "\n\n" + thinkingDirective
+            }
+        }
 
         let nonSystemMessages = messages.filter { $0.role != "system" }
 
@@ -56,7 +110,7 @@ public final class SiriModelService: Sendable {
             return (session, "")
         }
 
-        let promptText = lastMessage.content
+        let promptText = Self.sanitizeMessageText(lastMessage.content)
         let historyMessages = nonSystemMessages.dropLast()
 
         if historyMessages.isEmpty {
@@ -78,6 +132,7 @@ public final class SiriModelService: Sendable {
         }
 
         for message in historyMessages {
+            let cleanContent = Self.sanitizeMessageText(message.content)
             switch message.role.lowercased() {
             case "assistant":
                 transcriptEntries.append(
@@ -85,7 +140,7 @@ public final class SiriModelService: Sendable {
                         .init(
                             id: UUID().uuidString,
                             assetIDs: [],
-                            segments: [.text(.init(content: message.content))]
+                            segments: [.text(.init(content: cleanContent))]
                         )
                     )
                 )
@@ -93,7 +148,7 @@ public final class SiriModelService: Sendable {
                 transcriptEntries.append(
                     .prompt(
                         .init(
-                            segments: [.text(.init(content: message.content))],
+                            segments: [.text(.init(content: cleanContent))],
                             options: GenerationOptions()
                         )
                     )
@@ -118,6 +173,8 @@ public final class SiriModelService: Sendable {
         let response = try await session.respond(to: prompt, options: options)
         let modelName = request.model ?? "siri"
 
+        let (reasoning, content) = Self.extractReasoning(from: response.content)
+
         let usage = UsageInfo(
             prompt_tokens: response.usage.input.totalTokenCount,
             completion_tokens: response.usage.output.totalTokenCount,
@@ -126,7 +183,12 @@ public final class SiriModelService: Sendable {
 
         let choice = ChatChoice(
             index: 0,
-            message: ChatMessage(role: "assistant", content: response.content),
+            message: ChatMessage(
+                role: "assistant",
+                content: content,
+                reasoning_content: reasoning,
+                reasoning: reasoning
+            ),
             finish_reason: "stop"
         )
 
@@ -162,6 +224,7 @@ public final class SiriModelService: Sendable {
                     var previousContent = ""
                     var hasSentRole = false
                     var lastUsage: UsageInfo? = nil
+                    let reasoningParser = StreamingReasoningParser()
 
                     for try await chunk in responseStream {
                         let fullContent = chunk.content
@@ -179,10 +242,11 @@ public final class SiriModelService: Sendable {
                             total_tokens: chunk.usage.totalTokenCount
                         )
 
-                        let deltaRole: String? = hasSentRole ? nil : "assistant"
-                        hasSentRole = true
+                        let parsedItems = reasoningParser.process(delta: deltaContent)
+                        for item in parsedItems {
+                            let deltaRole: String? = hasSentRole ? nil : "assistant"
+                            hasSentRole = true
 
-                        if !deltaContent.isEmpty || deltaRole != nil {
                             let chunkObject = ChatCompletionChunk(
                                 id: completionId,
                                 object: "chat.completion.chunk",
@@ -191,7 +255,12 @@ public final class SiriModelService: Sendable {
                                 choices: [
                                     ChunkChoice(
                                         index: 0,
-                                        delta: ChunkDelta(role: deltaRole, content: deltaContent.isEmpty ? nil : deltaContent),
+                                        delta: ChunkDelta(
+                                            role: deltaRole,
+                                            content: item.content,
+                                            reasoning_content: item.reasoning,
+                                            reasoning: item.reasoning
+                                        ),
                                         finish_reason: nil
                                     )
                                 ],
@@ -199,6 +268,32 @@ public final class SiriModelService: Sendable {
                             )
                             continuation.yield(chunkObject)
                         }
+                    }
+
+                    for item in reasoningParser.flush() {
+                        let deltaRole: String? = hasSentRole ? nil : "assistant"
+                        hasSentRole = true
+
+                        let chunkObject = ChatCompletionChunk(
+                            id: completionId,
+                            object: "chat.completion.chunk",
+                            created: created,
+                            model: modelName,
+                            choices: [
+                                ChunkChoice(
+                                    index: 0,
+                                    delta: ChunkDelta(
+                                        role: deltaRole,
+                                        content: item.content,
+                                        reasoning_content: item.reasoning,
+                                        reasoning: item.reasoning
+                                    ),
+                                    finish_reason: nil
+                                )
+                            ],
+                            usage: nil
+                        )
+                        continuation.yield(chunkObject)
                     }
 
                     let finalChunk = ChatCompletionChunk(
@@ -222,5 +317,111 @@ public final class SiriModelService: Sendable {
                 }
             }
         }
+    }
+}
+
+/// Incrementally extracts <think>...</think> reasoning traces from streaming tokens.
+final class StreamingReasoningParser: @unchecked Sendable {
+    private enum State {
+        case pendingTag
+        case insideThinking
+        case insideContent
+    }
+
+    private var state: State = .pendingTag
+    private var buffer = ""
+
+    func process(delta: String) -> [(reasoning: String?, content: String?)] {
+        buffer += delta
+        var results: [(reasoning: String?, content: String?)] = []
+
+        while !buffer.isEmpty {
+            switch state {
+            case .pendingTag:
+                let trimmed = buffer.trimmingCharacters(in: .whitespacesAndNewlines)
+                if trimmed.isEmpty {
+                    return results
+                }
+                if "<think>".hasPrefix(trimmed) || "<thought>".hasPrefix(trimmed) {
+                    if buffer.count < 9 {
+                        return results
+                    }
+                }
+                if let thinkRange = buffer.range(of: "<think>") {
+                    let before = String(buffer[..<thinkRange.lowerBound])
+                    if !before.isEmpty {
+                        results.append((reasoning: nil, content: before))
+                    }
+                    buffer.removeSubrange(..<thinkRange.upperBound)
+                    state = .insideThinking
+                } else if let thoughtRange = buffer.range(of: "<thought>") {
+                    let before = String(buffer[..<thoughtRange.lowerBound])
+                    if !before.isEmpty {
+                        results.append((reasoning: nil, content: before))
+                    }
+                    buffer.removeSubrange(..<thoughtRange.upperBound)
+                    state = .insideThinking
+                } else {
+                    if buffer.count > 10 || !buffer.hasPrefix("<") {
+                        results.append((reasoning: nil, content: buffer))
+                        buffer = ""
+                        state = .insideContent
+                    } else {
+                        return results
+                    }
+                }
+
+            case .insideThinking:
+                if let endRange = buffer.range(of: "</think>") {
+                    let thought = String(buffer[..<endRange.lowerBound])
+                    if !thought.isEmpty {
+                        results.append((reasoning: thought, content: nil))
+                    }
+                    buffer.removeSubrange(..<endRange.upperBound)
+                    while buffer.hasPrefix("\n") || buffer.hasPrefix("\r") {
+                        buffer.removeFirst()
+                    }
+                    state = .insideContent
+                } else if let endRange = buffer.range(of: "</thought>") {
+                    let thought = String(buffer[..<endRange.lowerBound])
+                    if !thought.isEmpty {
+                        results.append((reasoning: thought, content: nil))
+                    }
+                    buffer.removeSubrange(..<endRange.upperBound)
+                    while buffer.hasPrefix("\n") || buffer.hasPrefix("\r") {
+                        buffer.removeFirst()
+                    }
+                    state = .insideContent
+                } else {
+                    let safeEnd = buffer.count > 10 ? buffer.index(buffer.endIndex, offsetBy: -10) : buffer.startIndex
+                    if safeEnd > buffer.startIndex {
+                        let safeText = String(buffer[..<safeEnd])
+                        buffer.removeSubrange(..<safeEnd)
+                        results.append((reasoning: safeText, content: nil))
+                    }
+                    return results
+                }
+
+            case .insideContent:
+                results.append((reasoning: nil, content: buffer))
+                buffer = ""
+            }
+        }
+
+        return results
+    }
+
+    func flush() -> [(reasoning: String?, content: String?)] {
+        var results: [(reasoning: String?, content: String?)] = []
+        if !buffer.isEmpty {
+            switch state {
+            case .insideThinking:
+                results.append((reasoning: buffer, content: nil))
+            default:
+                results.append((reasoning: nil, content: buffer))
+            }
+            buffer = ""
+        }
+        return results
     }
 }
