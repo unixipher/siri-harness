@@ -255,7 +255,9 @@ public final class SiriModelService: Sendable {
             .map { Self.sanitizeMessageText($0.content) }
             .joined(separator: "\n\n")
 
-        if enableThinking {
+        let effectiveThinking = enableThinking && tools.isEmpty
+
+        if effectiveThinking {
             let thinkingDirective = """
             Before answering, provide your step-by-step reasoning inside <think>...</think> tags.
             After </think>, provide your final answer in normal, natural conversational prose (plain text or markdown).
@@ -280,7 +282,7 @@ public final class SiriModelService: Sendable {
 
         if !tools.isEmpty {
             let toolDirective = """
-            Only call tools when strictly needed to answer the user's question or when information is requested that only tools can provide. For general conversation, jokes, greeting, or questions not requiring tools, respond directly with text without invoking any tool.
+            You are equipped with tools. If an available tool can answer the user's request, invoke the tool directly. Do not output text before invoking the tool.
             """
             systemInstructions += "\n\n" + toolDirective
         }
