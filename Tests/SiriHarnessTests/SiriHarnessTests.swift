@@ -155,15 +155,45 @@ struct SiriHarnessTests {
         #expect(str.contains("\"content\":\"Hello\""))
     }
 
-    @Test("ModelListResponse lists supported models")
+    @Test("ModelListResponse lists supported models including flash and pro")
     func testModelListResponse() throws {
         let models = SiriModelService.supportedModels.map { ModelObject(id: $0) }
         let response = ModelListResponse(data: models)
         let ids = response.data.map(\.id)
 
+        #expect(ids.contains("siri-flash"))
+        #expect(ids.contains("siri-pro"))
         #expect(ids.contains("siri"))
         #expect(ids.contains("siri-reasoner"))
         #expect(ids.contains("apple-intelligence"))
+    }
+
+    @Test("Verify isReasoningEnabled profile routing")
+    func testReasoningProfileRouting() throws {
+        let flashReq = ChatCompletionRequest(model: "siri-flash")
+        let proReq = ChatCompletionRequest(model: "siri-pro")
+        let defaultReq = ChatCompletionRequest(model: "siri")
+        let reasonerReq = ChatCompletionRequest(model: "siri-reasoner")
+
+        #expect(SiriModelService.isReasoningEnabled(for: flashReq) == false)
+        #expect(SiriModelService.isReasoningEnabled(for: proReq) == true)
+        #expect(SiriModelService.isReasoningEnabled(for: defaultReq) == false)
+        #expect(SiriModelService.isReasoningEnabled(for: reasonerReq) == true)
+    }
+
+    @Test("Normalize simulated tool JSON into plain text")
+    func testNormalizeContentFormat() throws {
+        let mockJson = """
+        ```json
+        {
+          "message": "Searching for the current Prime Minister of Indonesia...",
+          "web_search_result": "Indonesia is a republic led by a President.",
+          "tool_call_id": "search_123"
+        }
+        ```
+        """
+        let normalized = SiriModelService.normalizeContentFormat(mockJson)
+        #expect(normalized == "Indonesia is a republic led by a President.")
     }
 
     @Test("Extract reasoning from think tags and sanitize out-of-band prefixes")

@@ -7,10 +7,13 @@ public final class SiriModelService: Sendable {
 
     /// Standard supported model identifier aliases.
     public static let supportedModels = [
+        "siri-flash",
+        "siri-pro",
         "siri",
         "siri-reasoner",
         "siri-thinking",
-        "siri-model",
+        "apple-intelligence-flash",
+        "apple-intelligence-pro",
         "apple-intelligence",
         "apple-intelligence-reasoner",
         "apple/system-language-model",
@@ -18,6 +21,31 @@ public final class SiriModelService: Sendable {
     ]
 
     public init() {}
+
+    /// Determines whether reasoning / Chain-of-Thought should be enabled for a request.
+    /// Flash profiles produce immediate, zero-reasoning responses.
+    /// Pro / Reasoner profiles produce full step-by-step reasoning traces.
+    public static func isReasoningEnabled(for request: ChatCompletionRequest) -> Bool {
+        let model = (request.model ?? "").lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // Explicit Flash profiles always disable reasoning for maximum speed
+        if model.contains("flash") || model == "siri" {
+            return false
+        }
+
+        // Explicit Pro / Reasoner profiles always enable reasoning
+        if model.contains("pro") || model.contains("reason") || model.contains("thinking") {
+            return true
+        }
+
+        // Check explicit request reasoning_effort parameter (e.g. from Hermes or OpenAI clients)
+        if let effort = request.reasoning_effort?.lowercased() {
+            return effort != "none" && effort != "off"
+        }
+
+        // Default to false for fastest direct answers
+        return false
+    }
 
     /// Sanitizes message text by stripping out-of-band runtime prefixes.
     private static func sanitizeMessageText(_ text: String) -> String {
@@ -149,6 +177,15 @@ public final class SiriModelService: Sendable {
             } else {
                 systemInstructions += "\n\n" + thinkingDirective
             }
+        } else {
+            let directDirective = """
+            Provide a direct, concise response in natural conversational prose. Never format your response as simulated tool execution JSON, pseudo-code payloads, or raw JSON dictionaries unless explicitly requested.
+            """
+            if systemInstructions.isEmpty {
+                systemInstructions = directDirective
+            } else {
+                systemInstructions += "\n\n" + directDirective
+            }
         }
 
         let nonSystemMessages = messages.filter { $0.role != "system" }
@@ -211,7 +248,8 @@ public final class SiriModelService: Sendable {
 
     /// Performs a non-streaming chat completion.
     public func generate(request: ChatCompletionRequest) async throws -> ChatCompletionResponse {
-        let (session, prompt) = try createSessionAndPrompt(from: request.messages)
+        let enableThinking = Self.isReasoningEnabled(for: request)
+        let (session, prompt) = try createSessionAndPrompt(from: request.messages, enableThinking: enableThinking)
         let options = buildGenerationOptions(
             temperature: request.temperature,
             maxTokens: request.effectiveMaxTokens,
@@ -219,9 +257,11 @@ public final class SiriModelService: Sendable {
         )
 
         let response = try await session.respond(to: prompt, options: options)
-        let modelName = request.model ?? "siri"
+        let modelName = request.model ?? (enableThinking ? "siri-pro" : "siri-flash")
 
-        let (reasoning, content) = Self.extractReasoning(from: response.content)
+        let (reasoning, content) = enableThinking
+            ? Self.extractReasoning(from: response.content)
+            : (nil, Self.normalizeContentFormat(Self.sanitizeMessageText(response.content)))
 
         let usage = UsageInfo(
             prompt_tokens: response.usage.input.totalTokenCount,
@@ -255,13 +295,14 @@ public final class SiriModelService: Sendable {
         request: ChatCompletionRequest
     ) throws -> AsyncThrowingStream<ChatCompletionChunk, Error> {
         let completionId = "chatcmpl-" + UUID().uuidString
-        let modelName = request.model ?? "siri"
+        let enableThinking = Self.isReasoningEnabled(for: request)
+        let modelName = request.model ?? (enableThinking ? "siri-pro" : "siri-flash")
         let created = Int(Date().timeIntervalSince1970)
 
         return AsyncThrowingStream { continuation in
             Task {
                 do {
-                    let (session, prompt) = try self.createSessionAndPrompt(from: request.messages)
+                    let (session, prompt) = try self.createSessionAndPrompt(from: request.messages, enableThinking: enableThinking)
                     let options = self.buildGenerationOptions(
                         temperature: request.temperature,
                         maxTokens: request.effectiveMaxTokens,
@@ -272,7 +313,7 @@ public final class SiriModelService: Sendable {
                     var previousContent = ""
                     var hasSentRole = false
                     var lastUsage: UsageInfo? = nil
-                    let reasoningParser = StreamingReasoningParser()
+                    let reasoningParser = enableThinking ? StreamingReasoningParser() : nil
 
                     for try await chunk in responseStream {
                         let fullContent = chunk.content
@@ -290,8 +331,65 @@ public final class SiriModelService: Sendable {
                             total_tokens: chunk.usage.totalTokenCount
                         )
 
-                        let parsedItems = reasoningParser.process(delta: deltaContent)
-                        for item in parsedItems {
+                        if let parser = reasoningParser {
+                            let parsedItems = parser.process(delta: deltaContent)
+                            for item in parsedItems {
+                                let deltaRole: String? = hasSentRole ? nil : "assistant"
+                                hasSentRole = true
+
+                                let chunkObject = ChatCompletionChunk(
+                                    id: completionId,
+                                    object: "chat.completion.chunk",
+                                    created: created,
+                                    model: modelName,
+                                    choices: [
+                                        ChunkChoice(
+                                            index: 0,
+                                            delta: ChunkDelta(
+                                                role: deltaRole,
+                                                content: item.content,
+                                                reasoning_content: item.reasoning,
+                                                reasoning: item.reasoning
+                                            ),
+                                            finish_reason: nil
+                                        )
+                                    ],
+                                    usage: nil
+                                )
+                                continuation.yield(chunkObject)
+                            }
+                        } else {
+                            // Flash mode: direct instant streaming without reasoning delay
+                            let deltaRole: String? = hasSentRole ? nil : "assistant"
+                            hasSentRole = true
+
+                            if !deltaContent.isEmpty || deltaRole != nil {
+                                let chunkObject = ChatCompletionChunk(
+                                    id: completionId,
+                                    object: "chat.completion.chunk",
+                                    created: created,
+                                    model: modelName,
+                                    choices: [
+                                        ChunkChoice(
+                                            index: 0,
+                                            delta: ChunkDelta(
+                                                role: deltaRole,
+                                                content: deltaContent.isEmpty ? nil : deltaContent,
+                                                reasoning_content: nil,
+                                                reasoning: nil
+                                            ),
+                                            finish_reason: nil
+                                        )
+                                    ],
+                                    usage: nil
+                                )
+                                continuation.yield(chunkObject)
+                            }
+                        }
+                    }
+
+                    if let parser = reasoningParser {
+                        for item in parser.flush() {
                             let deltaRole: String? = hasSentRole ? nil : "assistant"
                             hasSentRole = true
 
@@ -316,32 +414,6 @@ public final class SiriModelService: Sendable {
                             )
                             continuation.yield(chunkObject)
                         }
-                    }
-
-                    for item in reasoningParser.flush() {
-                        let deltaRole: String? = hasSentRole ? nil : "assistant"
-                        hasSentRole = true
-
-                        let chunkObject = ChatCompletionChunk(
-                            id: completionId,
-                            object: "chat.completion.chunk",
-                            created: created,
-                            model: modelName,
-                            choices: [
-                                ChunkChoice(
-                                    index: 0,
-                                    delta: ChunkDelta(
-                                        role: deltaRole,
-                                        content: item.content,
-                                        reasoning_content: item.reasoning,
-                                        reasoning: item.reasoning
-                                    ),
-                                    finish_reason: nil
-                                )
-                            ],
-                            usage: nil
-                        )
-                        continuation.yield(chunkObject)
                     }
 
                     let finalChunk = ChatCompletionChunk(
