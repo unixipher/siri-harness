@@ -77,8 +77,8 @@ public final class SiriModelService: Sendable {
             budgeted.replaceSubrange(startRange.lowerBound...endRange.upperBound, with: "[Skills catalog omitted for on-device context budget]")
         }
 
-        // If instructions still exceed safe threshold (~4,500 chars / ~1,200 tokens), truncate gracefully
-        let maxInstructionsLength = 4500
+        // If instructions still exceed safe threshold (~3,000 chars / ~750 tokens), truncate gracefully
+        let maxInstructionsLength = 3000
         if budgeted.count > maxInstructionsLength {
             let truncated = String(budgeted.prefix(maxInstructionsLength))
             budgeted = truncated + "\n[System instructions truncated for on-device context budget]"
@@ -316,9 +316,18 @@ public final class SiriModelService: Sendable {
 
         var effectiveTools = tools
         if !lastAttachments.isEmpty {
-            // When images are present, omit auxiliary vision tools like vision_analyze
-            // because Apple Intelligence processes the image natively via multimodal attachments.
-            effectiveTools = tools.filter { $0.name != "vision_analyze" }
+            // When images are present, Apple FoundationModels processes the image natively via multimodal attachments.
+            // Tools are not needed for visual descriptions and passing dozens of schemas will exceed the 4,096-token limit.
+            let lowerPrompt = promptText.lowercased()
+            let explicitlyRequestsTool = lowerPrompt.contains("run") || lowerPrompt.contains("terminal") || lowerPrompt.contains("search") || lowerPrompt.contains("command")
+            if !explicitlyRequestsTool {
+                effectiveTools = []
+            } else {
+                effectiveTools = Array(tools.filter { $0.name != "vision_analyze" }.prefix(3))
+            }
+        } else if effectiveTools.count > 5 {
+            // For general queries, cap tools to 5 to keep schema tokens well within the 4K context budget
+            effectiveTools = Array(effectiveTools.prefix(5))
         }
 
         let effectiveThinking = enableThinking && effectiveTools.isEmpty
@@ -360,7 +369,7 @@ public final class SiriModelService: Sendable {
             promptText
         }
 
-        let historyMessages = nonSystemMessages.dropLast()
+        let historyMessages = Array(nonSystemMessages.dropLast().suffix(2))
 
         if historyMessages.isEmpty {
             let session = LanguageModelSession(tools: effectiveTools, instructions: systemInstructions.isEmpty ? nil : systemInstructions)
