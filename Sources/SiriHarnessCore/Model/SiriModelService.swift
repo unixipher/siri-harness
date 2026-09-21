@@ -90,22 +90,26 @@ public final class SiriModelService: Sendable {
     /// Loads an image attachment from a base64 data URI, file path, or raw base64 string.
     /// Uses thumbnail decoding to quickly load high-resolution images within Neural Engine token limits.
     public static func loadImageAttachment(from source: String) -> Attachment<ImageAttachmentContent>? {
+        let cleanSource = source.trimmingCharacters(in: .whitespacesAndNewlines).trimmingCharacters(in: CharacterSet(charactersIn: "\"\'"))
         var data: Data? = nil
 
-        if source.hasPrefix("data:image/") {
-            if let commaIndex = source.firstIndex(of: ",") {
-                let base64 = String(source[source.index(after: commaIndex)...])
+        if cleanSource.hasPrefix("data:image/") {
+            if let commaIndex = cleanSource.firstIndex(of: ",") {
+                let base64 = String(cleanSource[cleanSource.index(after: commaIndex)...])
                 data = Data(base64Encoded: base64, options: .ignoreUnknownCharacters)
             }
-        } else if source.hasPrefix("file://") {
-            if let url = URL(string: source) {
+        } else if cleanSource.hasPrefix("file://") {
+            let pathPart = String(cleanSource.dropFirst("file://".count))
+            if FileManager.default.fileExists(atPath: pathPart) {
+                data = try? Data(contentsOf: URL(fileURLWithPath: pathPart))
+            } else if let url = URL(string: cleanSource) {
                 data = try? Data(contentsOf: url)
             }
-        } else if FileManager.default.fileExists(atPath: source) {
-            data = try? Data(contentsOf: URL(fileURLWithPath: source))
-        } else if let localUrl = URL(string: source), FileManager.default.fileExists(atPath: localUrl.path) {
+        } else if FileManager.default.fileExists(atPath: cleanSource) {
+            data = try? Data(contentsOf: URL(fileURLWithPath: cleanSource))
+        } else if let localUrl = URL(string: cleanSource), FileManager.default.fileExists(atPath: localUrl.path) {
             data = try? Data(contentsOf: localUrl)
-        } else if let base64Data = Data(base64Encoded: source, options: .ignoreUnknownCharacters), !base64Data.isEmpty {
+        } else if let base64Data = Data(base64Encoded: cleanSource, options: .ignoreUnknownCharacters), !base64Data.isEmpty {
             data = base64Data
         }
 

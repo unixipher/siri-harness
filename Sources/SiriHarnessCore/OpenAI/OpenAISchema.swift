@@ -277,14 +277,31 @@ public struct ChatMessage: Codable, Sendable, Equatable {
                 }
             }
 
-            if let regex = try? NSRegularExpression(pattern: "image_url:\\s*([^\\s\\]]+)") {
+            // Match image_url: <path> even with spaces (e.g. /Users/.../Application Support/...)
+            if let regex = try? NSRegularExpression(pattern: "image_url:\\s*([^\\]\\r\\n]+)") {
                 let nsString = content as NSString
                 let matches = regex.matches(in: content, range: NSRange(location: 0, length: nsString.length))
                 for match in matches {
                     if match.numberOfRanges > 1 {
-                        let captured = nsString.substring(with: match.range(at: 1))
-                        if !captured.isEmpty && !urls.contains(captured) {
-                            urls.append(captured)
+                        let rawPath = nsString.substring(with: match.range(at: 1)).trimmingCharacters(in: .whitespacesAndNewlines)
+                        let cleanPath = rawPath.trimmingCharacters(in: CharacterSet(charactersIn: "\"\'"))
+                        if !cleanPath.isEmpty && !urls.contains(cleanPath) {
+                            urls.append(cleanPath)
+                        }
+                    }
+                }
+            }
+
+            // Match Hermes MEDIA: directive
+            if let regex = try? NSRegularExpression(pattern: "MEDIA:\\s*([^\\]\\r\\n]+)") {
+                let nsString = content as NSString
+                let matches = regex.matches(in: content, range: NSRange(location: 0, length: nsString.length))
+                for match in matches {
+                    if match.numberOfRanges > 1 {
+                        let rawPath = nsString.substring(with: match.range(at: 1)).trimmingCharacters(in: .whitespacesAndNewlines)
+                        let cleanPath = rawPath.trimmingCharacters(in: CharacterSet(charactersIn: "\"\'"))
+                        if !cleanPath.isEmpty && !urls.contains(cleanPath) {
+                            urls.append(cleanPath)
                         }
                     }
                 }
