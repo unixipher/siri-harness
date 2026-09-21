@@ -225,6 +225,8 @@ public final class HTTPServer: @unchecked Sendable {
     public let modelService: SiriModelService
     private var listener: NWListener?
     private let queue = DispatchQueue(label: "com.apple.siri-harness.server", attributes: .concurrent)
+    private let lock = NSLock()
+    private var activeConnections: [UUID: ConnectionHandler] = [:]
 
     public init(host: String = "127.0.0.1", port: UInt16 = 8080, modelService: SiriModelService = .shared) {
         self.host = host
@@ -268,20 +270,37 @@ public final class HTTPServer: @unchecked Sendable {
     public func stop() {
         listener?.cancel()
         listener = nil
+
+        lock.lock()
+        for (_, handler) in activeConnections {
+            handler.connection.cancel()
+        }
+        activeConnections.removeAll()
+        lock.unlock()
     }
 
     private func handleNewConnection(_ connection: NWConnection) {
         let handler = ConnectionHandler(connection: connection, server: self)
+        lock.lock()
+        activeConnections[handler.id] = handler
+        lock.unlock()
         handler.start()
     }
 
-    func dispatchRequest(_ request: HTTPRequest, on connection: NWConnection) async {
+    func removeConnection(id: UUID) {
+        lock.lock()
+        activeConnections.removeValue(forKey: id)
+        lock.unlock()
+    }
+
+    func dispatchRequest(_ request: HTTPRequest, on connection: NWConnection, handler: ConnectionHandler) async {
         if request.method.uppercased() == "OPTIONS" {
             let response = HTTPResponse.corsPreflight()
-            sendResponse(response, on: connection, closeAfter: true)
+            sendResponse(response, on: connection, closeAfter: false, handler: handler)
             return
         }
 
+        let clientWantsClose = request.headers["connection"]?.lowercased() == "close"
         let path = request.path
 
         switch (request.method.uppercased(), path) {
@@ -307,25 +326,27 @@ public final class HTTPServer: @unchecked Sendable {
                     ],
                     body: jsonData
                 )
-                sendResponse(response, on: connection, closeAfter: true)
+                sendResponse(response, on: connection, closeAfter: clientWantsClose, handler: handler)
             }
 
         case ("GET", "/v1/models"):
             let models = SiriModelService.supportedModels.map { ModelObject(id: $0) }
             let response = ModelListResponse(data: models)
             let httpResponse = HTTPResponse.json(response)
-            sendResponse(httpResponse, on: connection, closeAfter: true)
+            sendResponse(httpResponse, on: connection, closeAfter: clientWantsClose, handler: handler)
 
         case ("POST", "/v1/chat/completions"):
-            await handleChatCompletions(request, on: connection)
+            await handleChatCompletions(request, on: connection, handler: handler)
 
         default:
             let notFound = HTTPResponse.rawJson("{\"error\": {\"message\": \"Resource not found: \(path)\", \"type\": \"invalid_request_error\"}}", statusCode: 404)
-            sendResponse(notFound, on: connection, closeAfter: true)
+            sendResponse(notFound, on: connection, closeAfter: true, handler: handler)
         }
     }
 
-    private func handleChatCompletions(_ request: HTTPRequest, on connection: NWConnection) async {
+    private func handleChatCompletions(_ request: HTTPRequest, on connection: NWConnection, handler: ConnectionHandler) async {
+        let clientWantsClose = request.headers["connection"]?.lowercased() == "close"
+
         do {
             let chatRequest = try JSONDecoder().decode(ChatCompletionRequest.self, from: request.body)
 
@@ -342,6 +363,7 @@ public final class HTTPServer: @unchecked Sendable {
 
                 guard let headerData = sseHeaders.data(using: .utf8) else {
                     connection.cancel()
+                    removeConnection(id: handler.id)
                     return
                 }
 
@@ -362,35 +384,62 @@ public final class HTTPServer: @unchecked Sendable {
 
                 let donePayload = "data: [DONE]\n\n"
                 if let doneData = donePayload.data(using: .utf8) {
-                    connection.send(content: doneData, completion: .contentProcessed({ _ in
-                        connection.cancel()
-                    }))
+                    let connectionId = handler.id
+                    connection.send(content: doneData, completion: .contentProcessed { [weak self] _ in
+                        guard let self = self else {
+                            connection.cancel()
+                            return
+                        }
+                        DispatchQueue.global().asyncAfter(deadline: .now() + 0.05) { [weak self] in
+                            self?.removeConnection(id: connectionId)
+                            connection.cancel()
+                        }
+                    })
                 } else {
+                    removeConnection(id: handler.id)
                     connection.cancel()
                 }
 
             } else {
                 let completion = try await modelService.generate(request: chatRequest)
                 let httpResponse = HTTPResponse.json(completion)
-                sendResponse(httpResponse, on: connection, closeAfter: true)
+                sendResponse(httpResponse, on: connection, closeAfter: clientWantsClose, handler: handler)
             }
         } catch {
             let errorResponse = HTTPResponse.rawJson("{\"error\": {\"message\": \"\(error.localizedDescription)\", \"type\": \"api_error\"}}", statusCode: 500)
-            sendResponse(errorResponse, on: connection, closeAfter: true)
+            sendResponse(errorResponse, on: connection, closeAfter: true, handler: handler)
         }
     }
 
-    private func sendResponse(_ response: HTTPResponse, on connection: NWConnection, closeAfter: Bool) {
-        let data = response.serialize()
-        connection.send(content: data, completion: .contentProcessed({ _ in
+    private func sendResponse(_ response: HTTPResponse, on connection: NWConnection, closeAfter: Bool, handler: ConnectionHandler) {
+        var finalResponse = response
+        if closeAfter {
+            finalResponse.headers["Connection"] = "close"
+        } else {
+            finalResponse.headers["Connection"] = "keep-alive"
+        }
+
+        let connectionId = handler.id
+        let data = finalResponse.serialize()
+        connection.send(content: data, completion: .contentProcessed { [weak self] error in
             if closeAfter {
-                connection.cancel()
+                guard let self = self else {
+                    connection.cancel()
+                    return
+                }
+                DispatchQueue.global().asyncAfter(deadline: .now() + 0.05) { [weak self] in
+                    self?.removeConnection(id: connectionId)
+                    connection.cancel()
+                }
+            } else {
+                handler.receiveNext()
             }
-        }))
+        })
     }
 }
 
 final class ConnectionHandler: @unchecked Sendable {
+    let id = UUID()
     let connection: NWConnection
     let server: HTTPServer
     var buffer = Data()
@@ -401,7 +450,7 @@ final class ConnectionHandler: @unchecked Sendable {
     }
 
     func start() {
-        let queue = DispatchQueue(label: "com.apple.siri-harness.conn.\(UUID().uuidString)")
+        let queue = DispatchQueue(label: "com.apple.siri-harness.conn.\(id.uuidString)")
         connection.start(queue: queue)
         receiveNext()
     }
@@ -417,13 +466,14 @@ final class ConnectionHandler: @unchecked Sendable {
                 if let request = possibleRequest {
                     self.buffer.removeSubrange(0..<bytesConsumed)
                     Task {
-                        await self.server.dispatchRequest(request, on: self.connection)
+                        await self.server.dispatchRequest(request, on: self.connection, handler: self)
                     }
                     return
                 }
             }
 
             if isComplete || error != nil {
+                self.server.removeConnection(id: self.id)
                 self.connection.cancel()
             } else {
                 self.receiveNext()
