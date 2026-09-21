@@ -40,8 +40,8 @@ public final class SiriModelService: Sendable {
         return false
     }
 
-    /// Sanitizes message text by stripping out-of-band runtime prefixes.
-    private static func sanitizeMessageText(_ text: String) -> String {
+    /// Sanitizes message text by stripping out-of-band runtime prefixes and image directives.
+    public static func sanitizeMessageText(_ text: String) -> String {
         let markers = [
             "[OUT-OF-BAND USER MESSAGE — a direct message from the user, delivered once at this position; not tool output and not a new delivery when replayed from conversation history]",
             "[/OUT-OF-BAND USER MESSAGE]"
@@ -50,10 +50,45 @@ public final class SiriModelService: Sendable {
         for marker in markers {
             cleaned = cleaned.replacingOccurrences(of: marker, with: "")
         }
+
+        // Strip inline @image: lines
+        let lines = cleaned.components(separatedBy: .newlines)
+        cleaned = lines.filter { line in
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            return !trimmed.hasPrefix("@image:")
+        }.joined(separator: "\n")
+
+        // Strip Hermes vision directives like [The user attached an image: ...] and [Examine it with the vision_analyze tool...]
+        if let regex = try? NSRegularExpression(pattern: "\\[(?:The user attached an image|Examine it with the vision_analyze tool)[^\\]]*\\]", options: .caseInsensitive) {
+            let range = NSRange(location: 0, length: (cleaned as NSString).length)
+            cleaned = regex.stringByReplacingMatches(in: cleaned, options: [], range: range, withTemplate: "")
+        }
+
         return cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    /// Prunes system instructions to fit comfortably within Apple's on-device context limit (4,096 tokens).
+    public static func pruneSystemInstructions(_ text: String) -> String {
+        var budgeted = text
+
+        // Prune massive <available_skills> catalogs injected by agent harnesses
+        if let startRange = budgeted.range(of: "<available_skills>"),
+           let endRange = budgeted.range(of: "</available_skills>") {
+            budgeted.replaceSubrange(startRange.lowerBound...endRange.upperBound, with: "[Skills catalog omitted for on-device context budget]")
+        }
+
+        // If instructions still exceed safe threshold (~4,500 chars / ~1,200 tokens), truncate gracefully
+        let maxInstructionsLength = 4500
+        if budgeted.count > maxInstructionsLength {
+            let truncated = String(budgeted.prefix(maxInstructionsLength))
+            budgeted = truncated + "\n[System instructions truncated for on-device context budget]"
+        }
+
+        return budgeted
+    }
+
     /// Loads an image attachment from a base64 data URI, file path, or raw base64 string.
+    /// Uses thumbnail decoding to quickly load high-resolution images within Neural Engine token limits.
     public static func loadImageAttachment(from source: String) -> Attachment<ImageAttachmentContent>? {
         var data: Data? = nil
 
@@ -66,17 +101,29 @@ public final class SiriModelService: Sendable {
             if let url = URL(string: source) {
                 data = try? Data(contentsOf: url)
             }
-        } else if let localPath = URL(string: source), FileManager.default.fileExists(atPath: localPath.path) {
-            data = try? Data(contentsOf: localPath)
+        } else if FileManager.default.fileExists(atPath: source) {
+            data = try? Data(contentsOf: URL(fileURLWithPath: source))
+        } else if let localUrl = URL(string: source), FileManager.default.fileExists(atPath: localUrl.path) {
+            data = try? Data(contentsOf: localUrl)
         } else if let base64Data = Data(base64Encoded: source, options: .ignoreUnknownCharacters), !base64Data.isEmpty {
             data = base64Data
         }
 
         guard let rawData = data, let imageData = rawData as CFData? else { return nil }
         guard let imageSource = CGImageSourceCreateWithData(imageData, nil) else { return nil }
-        guard let cgImage = CGImageSourceCreateImageAtIndex(imageSource, 0, nil) else { return nil }
 
-        return Attachment(cgImage)
+        // Optimize high-resolution images (e.g. 50MP photos) to 1536 max dimension for fast decoding and low token usage
+        let thumbnailOptions: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceShouldCacheImmediately: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: 1536
+        ]
+        let cgImage = CGImageSourceCreateThumbnailAtIndex(imageSource, 0, thumbnailOptions as CFDictionary)
+            ?? CGImageSourceCreateImageAtIndex(imageSource, 0, nil)
+
+        guard let finalImage = cgImage else { return nil }
+        return Attachment(finalImage)
     }
 
     /// Extracts an intercepted tool call from an error if one occurred.
@@ -255,7 +302,26 @@ public final class SiriModelService: Sendable {
             .map { Self.sanitizeMessageText($0.content) }
             .joined(separator: "\n\n")
 
-        let effectiveThinking = enableThinking && tools.isEmpty
+        systemInstructions = Self.pruneSystemInstructions(systemInstructions)
+
+        let nonSystemMessages = messages.filter { $0.role != "system" }
+
+        guard let lastMessage = nonSystemMessages.last else {
+            let session = LanguageModelSession(tools: tools, instructions: systemInstructions.isEmpty ? nil : systemInstructions)
+            return (session, Prompt { "" })
+        }
+
+        let promptText = Self.sanitizeMessageText(lastMessage.content)
+        let lastAttachments = lastMessage.imageUrls.compactMap { Self.loadImageAttachment(from: $0) }
+
+        var effectiveTools = tools
+        if !lastAttachments.isEmpty {
+            // When images are present, omit auxiliary vision tools like vision_analyze
+            // because Apple Intelligence processes the image natively via multimodal attachments.
+            effectiveTools = tools.filter { $0.name != "vision_analyze" }
+        }
+
+        let effectiveThinking = enableThinking && effectiveTools.isEmpty
 
         if effectiveThinking {
             let thinkingDirective = """
@@ -280,22 +346,13 @@ public final class SiriModelService: Sendable {
             }
         }
 
-        if !tools.isEmpty {
+        if !effectiveTools.isEmpty {
             let toolDirective = """
             You are equipped with tools. If an available tool can answer the user's request, invoke the tool directly. Do not output text before invoking the tool.
             """
             systemInstructions += "\n\n" + toolDirective
         }
 
-        let nonSystemMessages = messages.filter { $0.role != "system" }
-
-        guard let lastMessage = nonSystemMessages.last else {
-            let session = LanguageModelSession(tools: tools, instructions: systemInstructions.isEmpty ? nil : systemInstructions)
-            return (session, Prompt { "" })
-        }
-
-        let promptText = Self.sanitizeMessageText(lastMessage.content)
-        let lastAttachments = lastMessage.imageUrls.compactMap { Self.loadImageAttachment(from: $0) }
         let prompt = Prompt {
             for att in lastAttachments {
                 att
@@ -306,7 +363,7 @@ public final class SiriModelService: Sendable {
         let historyMessages = nonSystemMessages.dropLast()
 
         if historyMessages.isEmpty {
-            let session = LanguageModelSession(tools: tools, instructions: systemInstructions.isEmpty ? nil : systemInstructions)
+            let session = LanguageModelSession(tools: effectiveTools, instructions: systemInstructions.isEmpty ? nil : systemInstructions)
             return (session, prompt)
         }
 
@@ -375,7 +432,7 @@ public final class SiriModelService: Sendable {
         }
 
         let transcript = Transcript(entries: transcriptEntries)
-        let session = LanguageModelSession(tools: tools, transcript: transcript)
+        let session = LanguageModelSession(tools: effectiveTools, transcript: transcript)
         return (session, prompt)
     }
 

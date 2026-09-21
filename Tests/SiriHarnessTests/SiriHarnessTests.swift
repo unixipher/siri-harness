@@ -342,4 +342,40 @@ struct SiriHarnessTests {
         #expect(jsonString.contains("\"location\": \"Tokyo\"") || jsonString.contains("\"location\":\"Tokyo\""))
         #expect(jsonString.contains("22.5"))
     }
+
+    @Test("Extract inline image URLs from message string content")
+    func testExtractInlineImageUrls() throws {
+        let text = """
+        [The user attached an image: photo.jpg] [Examine it with the vision_analyze tool using image_url: /tmp/photo.jpg] what is this
+        @image:/tmp/photo.jpg
+        """
+        let msg = ChatMessage(role: "user", content: text)
+        #expect(msg.imageUrls.contains("/tmp/photo.jpg"))
+    }
+
+    @Test("Sanitize vision directives and inline image directives from text")
+    func testSanitizeMessageTextWithVisionPrefixes() throws {
+        let text = """
+        [The user attached an image: photo.jpg] [Examine it with the vision_analyze tool using image_url: /tmp/photo.jpg] what is this
+        @image:/tmp/photo.jpg
+        """
+        let cleaned = SiriModelService.sanitizeMessageText(text)
+        #expect(cleaned == "what is this")
+    }
+
+    @Test("Prune massive system instructions and available skills for on-device budget")
+    func testPruneSystemInstructions() throws {
+        var longPrompt = "You are a helpful assistant.\n\n<available_skills>\n"
+        for i in 1...200 {
+            longPrompt += "  skill-\(i): This is a very long description of a skill that takes up tokens.\n"
+        }
+        longPrompt += "</available_skills>\n\nAnswer concisely."
+
+        let pruned = SiriModelService.pruneSystemInstructions(longPrompt)
+        #expect(!pruned.contains("skill-100"))
+        #expect(pruned.contains("[Skills catalog omitted for on-device context budget]"))
+        #expect(pruned.contains("Answer concisely."))
+        #expect(pruned.count < 4800)
+    }
 }
+

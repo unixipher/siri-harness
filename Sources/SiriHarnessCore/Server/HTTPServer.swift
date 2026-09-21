@@ -369,37 +369,60 @@ public final class HTTPServer: @unchecked Sendable {
 
                 connection.send(content: headerData, completion: .contentProcessed({ _ in }))
 
-                let stream = try modelService.generateStream(request: chatRequest)
-                let encoder = JSONEncoder()
+                do {
+                    let stream = try modelService.generateStream(request: chatRequest)
+                    let encoder = JSONEncoder()
 
-                for try await chunk in stream {
-                    if let chunkJson = try? encoder.encode(chunk),
-                       let chunkString = String(data: chunkJson, encoding: .utf8) {
-                        let eventPayload = "data: \(chunkString)\n\n"
-                        if let eventData = eventPayload.data(using: .utf8) {
-                            connection.send(content: eventData, completion: .contentProcessed({ _ in }))
+                    for try await chunk in stream {
+                        if let chunkJson = try? encoder.encode(chunk),
+                           let chunkString = String(data: chunkJson, encoding: .utf8) {
+                            let eventPayload = "data: \(chunkString)\n\n"
+                            if let eventData = eventPayload.data(using: .utf8) {
+                                connection.send(content: eventData, completion: .contentProcessed({ _ in }))
+                            }
                         }
                     }
-                }
 
-                let donePayload = "data: [DONE]\n\n"
-                if let doneData = donePayload.data(using: .utf8) {
-                    let connectionId = handler.id
-                    connection.send(content: doneData, completion: .contentProcessed { [weak self] _ in
-                        guard let self = self else {
-                            connection.cancel()
-                            return
-                        }
-                        DispatchQueue.global().asyncAfter(deadline: .now() + 0.05) { [weak self] in
-                            self?.removeConnection(id: connectionId)
-                            connection.cancel()
-                        }
-                    })
-                } else {
-                    removeConnection(id: handler.id)
-                    connection.cancel()
+                    let donePayload = "data: [DONE]\n\n"
+                    if let doneData = donePayload.data(using: .utf8) {
+                        let connectionId = handler.id
+                        connection.send(content: doneData, completion: .contentProcessed { [weak self] _ in
+                            guard let self = self else {
+                                connection.cancel()
+                                return
+                            }
+                            DispatchQueue.global().asyncAfter(deadline: .now() + 0.05) { [weak self] in
+                                self?.removeConnection(id: connectionId)
+                                connection.cancel()
+                            }
+                        })
+                    } else {
+                        removeConnection(id: handler.id)
+                        connection.cancel()
+                    }
+                } catch {
+                    let escapedMsg = error.localizedDescription
+                        .replacingOccurrences(of: "\\", with: "\\\\")
+                        .replacingOccurrences(of: "\"", with: "\\\"")
+                        .replacingOccurrences(of: "\n", with: " ")
+                    let errPayload = "data: {\"error\": {\"message\": \"\(escapedMsg)\", \"type\": \"server_error\"}}\n\ndata: [DONE]\n\n"
+                    if let errData = errPayload.data(using: .utf8) {
+                        let connectionId = handler.id
+                        connection.send(content: errData, completion: .contentProcessed { [weak self] _ in
+                            guard let self = self else {
+                                connection.cancel()
+                                return
+                            }
+                            DispatchQueue.global().asyncAfter(deadline: .now() + 0.05) { [weak self] in
+                                self?.removeConnection(id: connectionId)
+                                connection.cancel()
+                            }
+                        })
+                    } else {
+                        removeConnection(id: handler.id)
+                        connection.cancel()
+                    }
                 }
-
             } else {
                 let completion = try await modelService.generate(request: chatRequest)
                 let httpResponse = HTTPResponse.json(completion)

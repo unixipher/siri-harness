@@ -255,11 +255,43 @@ public struct ChatMessage: Codable, Sendable, Equatable {
     }
 
     public var imageUrls: [String] {
-        guard let parts = contentParts else { return [] }
-        return parts.compactMap { part in
-            if case .imageUrl(let img) = part { return img.url }
-            return nil
+        var urls: [String] = []
+
+        if let parts = contentParts {
+            for part in parts {
+                if case .imageUrl(let img) = part, !urls.contains(img.url) {
+                    urls.append(img.url)
+                }
+            }
         }
+
+        if !content.isEmpty {
+            let lines = content.components(separatedBy: .newlines)
+            for line in lines {
+                let trimmed = line.trimmingCharacters(in: .whitespaces)
+                if trimmed.hasPrefix("@image:") {
+                    let path = String(trimmed.dropFirst("@image:".count)).trimmingCharacters(in: .whitespaces)
+                    if !path.isEmpty && !urls.contains(path) {
+                        urls.append(path)
+                    }
+                }
+            }
+
+            if let regex = try? NSRegularExpression(pattern: "image_url:\\s*([^\\s\\]]+)") {
+                let nsString = content as NSString
+                let matches = regex.matches(in: content, range: NSRange(location: 0, length: nsString.length))
+                for match in matches {
+                    if match.numberOfRanges > 1 {
+                        let captured = nsString.substring(with: match.range(at: 1))
+                        if !captured.isEmpty && !urls.contains(captured) {
+                            urls.append(captured)
+                        }
+                    }
+                }
+            }
+        }
+
+        return urls
     }
 }
 
