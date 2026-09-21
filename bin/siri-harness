@@ -1,0 +1,23 @@
+#!/bin/bash
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+CACHE_DIR="${ROOT_DIR}/.cache"
+BUILD_DIR="${ROOT_DIR}/.build/out/Products/Debug"
+DYLIB="${BUILD_DIR}/libSiriHarnessCore.dylib"
+
+mkdir -p "${CACHE_DIR}"
+
+# Build if dylib is missing
+if [ ! -f "${DYLIB}" ]; then
+    echo "Building SiriHarnessCore..." >&2
+    CLANG_MODULE_CACHE_PATH="${CACHE_DIR}" SWIFT_MODULE_CACHE_PATH="${CACHE_DIR}" swift build --disable-sandbox -Xswiftc -module-cache-path -Xswiftc "${CACHE_DIR}" >&2
+fi
+
+exec swift -module-cache-path "${CACHE_DIR}" \
+     -I "${BUILD_DIR}" \
+     -L "${BUILD_DIR}" \
+     -lSiriHarnessCore \
+     "${ROOT_DIR}/Sources/SiriHarness/main.swift" "$@"
