@@ -77,3 +77,4 @@ public struct DynamicTool: Tool, Sendable {
         throw ToolCallInterceptionError(toolCall: toolCall)
     }
 }
+
