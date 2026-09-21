@@ -247,4 +247,99 @@ struct SiriHarnessTests {
         #expect(jsonStr.contains("\"reasoning_content\":\"Thinking step...\""))
         #expect(jsonStr.contains("\"reasoning\":\"Thinking step...\""))
     }
+
+    @Test("Decode multimodal message with text and image_url")
+    func testMultimodalMessageDecoding() throws {
+        let json = """
+        {
+          "role": "user",
+          "content": [
+            { "type": "text", "text": "What is in this image?" },
+            { "type": "image_url", "image_url": { "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==" } }
+          ]
+        }
+        """
+        let data = try #require(json.data(using: .utf8))
+        let message = try JSONDecoder().decode(ChatMessage.self, from: data)
+
+        #expect(message.role == "user")
+        #expect(message.textContent == "What is in this image?")
+        #expect(message.imageUrls.count == 1)
+        #expect(message.imageUrls[0].hasPrefix("data:image/png;base64,"))
+    }
+
+    @Test("Load Attachment from base64 image data URI")
+    func testLoadImageAttachment() throws {
+        let base64Uri = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+        let attachment = SiriModelService.loadImageAttachment(from: base64Uri)
+        #expect(attachment != nil)
+    }
+
+    @Test("Decode and encode tool definitions and tool calls")
+    func testToolDefinitionAndCalls() throws {
+        let requestJson = """
+        {
+          "model": "siri-pro",
+          "messages": [
+            { "role": "user", "content": "What is the weather in Paris?" }
+          ],
+          "tools": [
+            {
+              "type": "function",
+              "function": {
+                "name": "get_weather",
+                "description": "Get weather for a city",
+                "parameters": {
+                  "type": "object",
+                  "properties": {
+                    "city": { "type": "string", "description": "City name" }
+                  },
+                  "required": ["city"]
+                }
+              }
+            }
+          ]
+        }
+        """
+        let data = try #require(requestJson.data(using: .utf8))
+        let req = try JSONDecoder().decode(ChatCompletionRequest.self, from: data)
+
+        #expect(req.tools?.count == 1)
+        let tool = try #require(req.tools?.first)
+        #expect(tool.function.name == "get_weather")
+
+        // DynamicTool conversion
+        let dynamicTool = DynamicTool(definition: tool)
+        #expect(dynamicTool.name == "get_weather")
+        #expect(dynamicTool.parameters.name == "GeneratedContent")
+
+        // Assistant response with tool_calls
+        let toolCall = ToolCall(id: "call_abc123", type: "function", function: FunctionCall(name: "get_weather", arguments: "{\"city\":\"Paris\"}"))
+        let assistantMsg = ChatMessage(role: "assistant", content: "", tool_calls: [toolCall])
+        let encodedMsg = try JSONEncoder().encode(assistantMsg)
+        let msgJsonStr = try #require(String(data: encodedMsg, encoding: .utf8))
+        #expect(msgJsonStr.contains("\"call_abc123\""))
+        #expect(msgJsonStr.contains("\"get_weather\""))
+        #expect(msgJsonStr.contains("Paris"))
+
+        // Tool output message
+        let toolMsg = ChatMessage(role: "tool", content: "20C sunny", tool_call_id: "call_abc123")
+        let encodedToolMsg = try JSONEncoder().encode(toolMsg)
+        let toolJsonStr = try #require(String(data: encodedToolMsg, encoding: .utf8))
+        #expect(toolJsonStr.contains("\"tool_call_id\":\"call_abc123\""))
+        #expect(toolJsonStr.contains("\"role\":\"tool\""))
+    }
+
+    @Test("Convert JSON object to GeneratedContent")
+    func testJsonObjectToGeneratedContent() throws {
+        let dict: [String: Any] = [
+            "location": "Tokyo",
+            "temperature": 22.5,
+            "is_raining": false
+        ]
+        let gc = SiriModelService.jsonObjectToGeneratedContent(dict)
+        let jsonString = gc.jsonString
+        #expect(jsonString.contains("\"location\": \"Tokyo\"") || jsonString.contains("\"location\":\"Tokyo\""))
+        #expect(jsonString.contains("22.5"))
+    }
 }
